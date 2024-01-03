@@ -1,5 +1,5 @@
 # Finetune-SVD
-Fine tune stable video diffusion.
+Finetune stable video diffusion(`image-to-video` model).
 
 ![tile](tile.gif)
 
