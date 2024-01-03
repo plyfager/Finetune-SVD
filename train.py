@@ -19,30 +19,21 @@ import torch.utils.checkpoint
 import torchvision.transforms as T
 import diffusers
 import transformers
-
 from torchvision import transforms
 from tqdm.auto import tqdm
-
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-
-# from models.unet_3d_condition import UNet3DConditionModel
-# from diffusers.models import AutoencoderKL
-# from diffusers import DPMSolverMultistepScheduler, DDPMScheduler, TextToVideoSDPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, export_to_video
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
 from diffusers.models.attention import BasicTransformerBlock
-
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.models.clip.modeling_clip import CLIPEncoder
 from utils.dataset import VideoJsonDataset, SingleVideoDataset, \
     ImageDataset, VideoFolderDataset, CachedDataset
 from einops import rearrange, repeat
-# from utils.lora_handler import LoraHandler, LORA_VERSIONS
-
 from PIL import Image
 import random
 from diffusers import AutoencoderKLTemporalDecoder
@@ -97,13 +88,7 @@ def create_output_folders(output_dir, config):
     return out_dir
 
 def load_primary_models(pretrained_model_path):
-    # noise_scheduler = DDPMScheduler.from_config(pretrained_model_path, subfolder="scheduler")
-    # tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
-    # text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
-    # vae = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
-    # unet = UNet3DConditionModel.from_pretrained(pretrained_model_path, subfolder="unet")
     noise_scheduler = EulerDiscreteScheduler.from_config(pretrained_model_path, subfolder="scheduler", variant="fp16")
-    # tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer") # what tokenizer?
     tokenizer = None
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(pretrained_model_path, subfolder="image_encoder", variant="fp16")
     vae = AutoencoderKLTemporalDecoder.from_pretrained(pretrained_model_path, subfolder="vae", variant="fp16")
@@ -751,12 +736,10 @@ def main(
             with accelerator.accumulate(unet):
 
                 with accelerator.autocast():
-
-                    # image = Image.fromarray(batch["image"].detach().cpu().numpy())
                     image = batch["image"]
                     max_guidance_scale = 3.0
 
-                    # 0. Default height and width to unet
+                    # Default height and width to unet
                     height = train_data.height or unet.config.sample_size * vae_scale_factor
                     width = train_data.width or unet.config.sample_size * vae_scale_factor
 
@@ -764,13 +747,6 @@ def main(
                     decode_chunk_size = None
                     decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else num_frames
 
-                    # 2. Define call parameters
-                    # if isinstance(Image.fromarray(image), PIL.Image.Image):
-                    #     batch_size = 1
-                    # elif isinstance(image, list):
-                    #     batch_size = len(image)
-                    # else:
-                    #     batch_size = image.size[0]
                     batch_size = image.size()[0]
                     image = image[0]
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -779,7 +755,7 @@ def main(
                     # corresponds to doing no classifier free guidance.
                     do_classifier_free_guidance = max_guidance_scale > 1.0
 
-                    # 3. Encode input image
+                    # Encode input image
                     image_embeddings = encode_image(image_processor, feature_extractor, image_encoder, image, device, num_videos_per_prompt, do_classifier_free_guidance)
 
                     # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
@@ -787,7 +763,7 @@ def main(
                     # See: https://github.com/Stability-AI/generative-models/blob/ed0997173f98eaf8f4edf7ba5fe8f15c6b877fd3/scripts/sampling/simple_video_sample.py#L188
                     fps = fps - 1
 
-                    # 4. Encode input image using VAE
+                    # Encode input image using VAE
                     image = image_processor.preprocess(image, height=height, width=width)
                     noise = randn_tensor(image.shape, generator=generator, device=image.device, dtype=image.dtype)
                     image = image + noise_aug_strength * noise
@@ -807,7 +783,7 @@ def main(
                     # image_latents [batch, channels, height, width] ->[batch, num_frames, channels, height, width]
                     image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
 
-                    # 5. Get Added Time IDs
+                    # Get Added Time IDs
                     added_time_ids = get_add_time_ids(
                         unet,
                         fps,
@@ -820,9 +796,7 @@ def main(
                     )
                     added_time_ids = added_time_ids.to(device)
 
-                    # 4. Prepare timesteps
-                    # scheduler.set_timesteps(num_inference_steps, device=device)
-                    # timesteps = scheduler.timesteps
+                    # Prepare timesteps
                     # Sample a random timestep for each video
                     pixel_values = batch["pixel_values"]
                     # pixel_values
@@ -835,7 +809,7 @@ def main(
                     timesteps = scheduler.timesteps
                     timesteps = timesteps[random_integer]
 
-                    # 7. Prepare guidance scale
+                    # Prepare guidance scale
                     guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)
                     guidance_scale = guidance_scale.to(device, latents.dtype)
                     guidance_scale = guidance_scale.repeat(batch_size * num_videos_per_prompt, 1)
