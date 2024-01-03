@@ -12,7 +12,7 @@ video path, prompt
 
 ## Start
 ```
-pip install -r requeriments.txt
+pip install -r requirements.txt
 ```
 
 ```
