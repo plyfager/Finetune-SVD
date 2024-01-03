@@ -849,7 +849,7 @@ def main(
                         should_detach = latent_model_input.shape[2] > 1 and i == 0
 
                         if should_truncate_video and i == 1:
-                            noisy_latents = latent_model_input[:,:,1,:,:].unsqueeze(2)
+                            latent_model_input = latent_model_input[:,:,1,:,:].unsqueeze(2)
                             target = target[:,:,1,:,:].unsqueeze(2)
                                 
                         encoder_hidden_states = (
