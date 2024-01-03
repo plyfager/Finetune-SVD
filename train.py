@@ -651,7 +651,7 @@ def main(
     )
 
     tokenizer = CLIPTokenizer.from_pretrained("damo-vilab/text-to-video-ms-1.7b", subfolder="tokenizer")
-    train_dataset = VideoCSVDataset(csv_path='./validation_warping.csv',
+    train_dataset = VideoCSVDataset(csv_path='./train.csv',
                               tokenizer=tokenizer,
                               fps = 29,
                               n_sample_frames=25,
