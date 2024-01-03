@@ -846,17 +846,17 @@ def main(
 
                     for i in range(2):
 
-                        should_detach = noisy_latents.shape[2] > 1 and i == 0
+                        should_detach = latent_model_input.shape[2] > 1 and i == 0
 
                         if should_truncate_video and i == 1:
-                            noisy_latents = noisy_latents[:,:,1,:,:].unsqueeze(2)
+                            noisy_latents = latent_model_input[:,:,1,:,:].unsqueeze(2)
                             target = target[:,:,1,:,:].unsqueeze(2)
                                 
                         encoder_hidden_states = (
                             detached_encoder_state if should_detach else trainable_encoder_state
                         )
 
-                        model_pred = unet(noisy_latents, timesteps, encoder_hidden_states=encoder_hidden_states).sample
+                        model_pred = unet(latent_model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
                         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                         losses.append(loss)
