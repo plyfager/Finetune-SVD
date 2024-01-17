@@ -29,13 +29,9 @@ from diffusers.utils import check_min_version, export_to_video
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.models.attention_processor import AttnProcessor2_0, Attention
 from diffusers.models.attention import BasicTransformerBlock
-from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.models.clip.modeling_clip import CLIPEncoder
-from utils.dataset import VideoJsonDataset, SingleVideoDataset, \
-    ImageDataset, VideoFolderDataset, CachedDataset
+
 from einops import rearrange, repeat
-from PIL import Image
-import random
 from diffusers import AutoencoderKLTemporalDecoder
 from diffusers import UNetSpatioTemporalConditionModel
 from diffusers import EulerDiscreteScheduler
@@ -46,6 +42,7 @@ from utils.dataset import VideoCSVDataset
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import load_image
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import _resize_with_antialiasing
 
 
 already_printed_trainables = False
@@ -89,13 +86,13 @@ def create_output_folders(output_dir, config):
 
 def load_primary_models(pretrained_model_path):
     noise_scheduler = EulerDiscreteScheduler.from_config(pretrained_model_path, subfolder="scheduler", variant="fp16")
-    tokenizer = None
+
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(pretrained_model_path, subfolder="image_encoder", variant="fp16")
     vae = AutoencoderKLTemporalDecoder.from_pretrained(pretrained_model_path, subfolder="vae", variant="fp16")
     unet = UNetSpatioTemporalConditionModel.from_pretrained(pretrained_model_path, subfolder="unet", variant="fp16")
     feature_extractor = CLIPImageProcessor.from_pretrained(pretrained_model_path, subfolder="feature_extractor", variant="fp16")
 
-    return noise_scheduler, tokenizer, image_encoder, vae, unet, feature_extractor
+    return noise_scheduler, image_encoder, vae, unet, feature_extractor
 
 def _compute_padding(kernel_size):
     """Compute padding tuple."""
@@ -174,43 +171,13 @@ def _gaussian_blur2d(input, kernel_size, sigma):
 
     return out
 
-# resizing utils
-# TODO: clean up later
-def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corners=True):
-    h, w = input.shape[-2:]
-    factors = (h / size[0], w / size[1])
-
-    # First, we have to determine sigma
-    # Taken from skimage: https://github.com/scikit-image/scikit-image/blob/v0.19.2/skimage/transform/_warps.py#L171
-    sigmas = (
-        max((factors[0] - 1.0) / 2.0, 0.001),
-        max((factors[1] - 1.0) / 2.0, 0.001),
-    )
-
-    # Now kernel size. Good results are for 3 sigma, but that is kind of slow. Pillow uses 1 sigma
-    # https://github.com/python-pillow/Pillow/blob/master/src/libImaging/Resample.c#L206
-    # But they do it in the 2 passes, which gives better results. Let's try 2 sigmas for now
-    ks = int(max(2.0 * 2 * sigmas[0], 3)), int(max(2.0 * 2 * sigmas[1], 3))
-
-    # Make sure it is odd
-    if (ks[0] % 2) == 0:
-        ks = ks[0] + 1, ks[1]
-
-    if (ks[1] % 2) == 0:
-        ks = ks[0], ks[1] + 1
-
-    input = _gaussian_blur2d(input, ks, sigmas)
-
-    output = torch.nn.functional.interpolate(input, size=size, mode=interpolation, align_corners=align_corners)
-    return output
-
-def encode_image(image_processor, feature_extractor, image_encoder, image, device, num_videos_per_prompt, do_classifier_free_guidance):
+def encode_image(feature_extractor, image_encoder, image, device, num_videos_per_prompt):
     dtype = next(image_encoder.parameters()).dtype
 
     # We normalize the image before resizing to match with the original implementation.
     # Then we unnormalize it after resizing.
-    image = image * 2.0 - 1.0
-    image = _resize_with_antialiasing(image, (224, 224))
+    # image = image * 2.0 - 1.0
+    image = _resize_with_antialiasing(image, (224, 224)).to(torch.half)
     image = (image + 1.0) / 2.0
 
     # Normalize the image with for CLIP input
@@ -232,15 +199,16 @@ def encode_image(image_processor, feature_extractor, image_encoder, image, devic
     image_embeddings = image_embeddings.repeat(1, num_videos_per_prompt, 1)
     image_embeddings = image_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
-    if do_classifier_free_guidance:
-        negative_image_embeddings = torch.zeros_like(image_embeddings)
-
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
-        image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
-
     return image_embeddings
+
+def _set_gradient_checkpointing(self, value=False):
+    self.gradient_checkpointing = value
+    self.mid_block.gradient_checkpointing = value
+    for module in self.down_blocks + self.up_blocks:
+        module.gradient_checkpointing = value   
+
+def unet_g_c(unet, unet_enable):
+    _set_gradient_checkpointing(unet, value=unet_enable)
 
 def freeze_models(models_to_freeze):
     for model in models_to_freeze:
@@ -306,16 +274,6 @@ def create_optim_params(name='param', params=None, lr=5e-6, extra_params=None):
             params[k] = v
     
     return params
-
-def negate_params(name, negation):
-    # We have to do this if we are co-training with LoRA.
-    # This ensures that parameter groups aren't duplicated.
-    if negation is None: return False
-    for n in negation:
-        if n in name and 'temp' not in name:
-            return True
-    return False
-
 
 def create_optimizer_params(model_list, lr):
     import itertools
@@ -385,7 +343,8 @@ def tensor_to_vae_latent(t, vae):
     latents = vae.encode(t).latent_dist.sample()
     latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
     latents = rearrange(latents, "b c f h w -> b f c h w")
-    latents = latents * 0.18215
+    # latents = latents * 0.18215
+    latents = latents * vae.config.scaling_factor
 
     return latents
 
@@ -445,35 +404,6 @@ def save_pipe(
     gc.collect()
 
 
-def replace_prompt(prompt, token, wlist):
-    for w in wlist:
-        if w in prompt: return prompt.replace(w, token)
-    return prompt 
-
-
-def encode_vae_image(
-    vae,
-    image: torch.Tensor,
-    device,
-    num_videos_per_prompt,
-    do_classifier_free_guidance,
-):
-    image = image.to(device=device)
-    image_latents = vae.encode(image).latent_dist.mode()
-
-    if do_classifier_free_guidance:
-        negative_image_latents = torch.zeros_like(image_latents)
-
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
-        image_latents = torch.cat([negative_image_latents, image_latents])
-
-    # duplicate image_latents for each generation per prompt, using mps friendly method
-    image_latents = image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
-
-    return image_latents
-
 def get_add_time_ids(
     unet,
     fps,
@@ -482,7 +412,6 @@ def get_add_time_ids(
     dtype,
     batch_size,
     num_videos_per_prompt,
-    do_classifier_free_guidance,
 ):
     add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
 
@@ -496,9 +425,6 @@ def get_add_time_ids(
 
     add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
     add_time_ids = add_time_ids.repeat(batch_size * num_videos_per_prompt, 1)
-
-    if do_classifier_free_guidance:
-        add_time_ids = torch.cat([add_time_ids, add_time_ids])
 
     return add_time_ids
 
@@ -537,12 +463,28 @@ def prepare_latents(
     latents = latents * scheduler.init_noise_sigma
     return latents
 
-def _append_dims(x, target_dims):
-    """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
-    dims_to_append = target_dims - x.ndim
-    if dims_to_append < 0:
-        raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}, which is less")
-    return x[(...,) + (None,) * dims_to_append]
+def handle_trainable_modules(model, trainable_modules=None, is_enabled=True, negation=None):
+    global already_printed_trainables
+
+    # This can most definitely be refactored :-)
+    unfrozen_params = 0
+    if trainable_modules is not None:
+        for name, module in model.named_modules():
+            for tm in tuple(trainable_modules):
+                if tm == 'all':
+                    model.requires_grad_(is_enabled)
+                    unfrozen_params =len(list(model.parameters()))
+                    break
+                    
+                # if tm in name and 'lora' not in name:
+                if tm in name:
+                    for m in module.parameters():
+                        m.requires_grad_(is_enabled)
+                        if is_enabled: unfrozen_params +=1
+
+    if unfrozen_params > 0 and not already_printed_trainables:
+        already_printed_trainables = True 
+        print(f"{unfrozen_params} params have been unfrozen for training.")
 
 def main(
     pretrained_model_path: str,
@@ -565,6 +507,7 @@ def main(
     adam_epsilon: float = 1e-08,
     max_grad_norm: float = 1.0,
     gradient_accumulation_steps: int = 1,
+    gradient_checkpointing: bool = False,
     checkpointing_steps: int = 500,
     resume_from_checkpoint: Optional[str] = None,
     resume_step: Optional[int] = None,
@@ -602,11 +545,16 @@ def main(
        output_dir = create_output_folders(output_dir, config)
 
     # Load scheduler, tokenizer and models.
-    scheduler, tokenizer, image_encoder, vae, unet, feature_extractor = load_primary_models(pretrained_model_path)
+    scheduler, image_encoder, vae, unet, feature_extractor = load_primary_models(pretrained_model_path)
 
     # Freeze any necessary models
-    # freeze_models([vae, image_encoder, unet])
-    freeze_models([vae, image_encoder])
+    freeze_models([vae, image_encoder, unet])
+
+    # Use Gradient Checkpointing if enabled.
+    unet_g_c(
+        unet, 
+        gradient_checkpointing
+    )
     
     # Enable xformers if available
     handle_memory_attention(enable_xformers_memory_efficient_attention, enable_torch_2_attn, unet)
@@ -650,13 +598,14 @@ def main(
         num_training_steps=max_train_steps * gradient_accumulation_steps,
     )
 
-    tokenizer = CLIPTokenizer.from_pretrained("damo-vilab/text-to-video-ms-1.7b", subfolder="tokenizer")
-    train_dataset = VideoCSVDataset(csv_path='./train.csv',
-                              tokenizer=tokenizer,
+    train_dataset = VideoCSVDataset(csv_path='/data/54T/wangqiang/svd/datasets/validation_warping.csv',
                               fps = 29,
                               n_sample_frames=25,
                               width=1024,
-                              height=576)
+                              height=576
+                            #   width=512,
+                            #   height=512
+                              )
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -685,6 +634,9 @@ def main(
     generator = torch.manual_seed(42)
     noise_aug_strength = 0.02
     motion_bucket_id = 127
+    P_mean=0.7
+    P_std=1.6
+    noise_aug_strength=0.02
     num_inference_steps = 25
     min_guidance_scale = 1.0
 
@@ -723,6 +675,16 @@ def main(
     progress_bar = tqdm(range(global_step, max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    # Unfreeze UNET Layers
+    unet.train()
+    print("trainable_modules: ", trainable_modules)
+    handle_trainable_modules(
+        unet, 
+        trainable_modules, 
+        is_enabled=True,
+        negation=None
+    )
+
     for epoch in range(first_epoch, num_train_epochs):
         train_loss = 0.0
         
@@ -737,7 +699,6 @@ def main(
 
                 with accelerator.autocast():
                     image = batch["image"]
-                    max_guidance_scale = 3.0
 
                     # Default height and width to unet
                     height = train_data.height or unet.config.sample_size * vae_scale_factor
@@ -750,13 +711,9 @@ def main(
                     batch_size = image.size()[0]
                     image = image[0]
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-                    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-                    # corresponds to doing no classifier free guidance.
-                    do_classifier_free_guidance = max_guidance_scale > 1.0
 
                     # Encode input image
-                    image_embeddings = encode_image(image_processor, feature_extractor, image_encoder, image, device, num_videos_per_prompt, do_classifier_free_guidance)
+                    image_embeddings = encode_image(feature_extractor, image_encoder, image, device, num_videos_per_prompt)
 
                     # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
                     # is why it is reduced here.
@@ -764,7 +721,7 @@ def main(
                     fps = fps - 1
 
                     # Encode input image using VAE
-                    image = image_processor.preprocess(image, height=height, width=width)
+                    image = image_processor.preprocess(image, height=height, width=width).to(device)
                     noise = randn_tensor(image.shape, generator=generator, device=image.device, dtype=image.dtype)
                     image = image + noise_aug_strength * noise
 
@@ -772,8 +729,8 @@ def main(
                     if needs_upcasting:
                         vae.to(dtype=torch.float32)
 
-                    image_latents = encode_vae_image(vae, image, device, num_videos_per_prompt, do_classifier_free_guidance)
-                    image_latents = image_latents.to(image_embeddings.dtype)
+                    image_latents = vae.encode(image).latent_dist.mode()
+                    image_latents = repeat(image_latents, 'b c h w->b f c h w',f=num_frames)
 
                     # cast back to fp16 if needed
                     if needs_upcasting:
@@ -781,7 +738,7 @@ def main(
 
                     # Repeat the image latents for each frame so we can concatenate them with the noise
                     # image_latents [batch, channels, height, width] ->[batch, num_frames, channels, height, width]
-                    image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
+                    # image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
 
                     # Get Added Time IDs
                     added_time_ids = get_add_time_ids(
@@ -792,7 +749,6 @@ def main(
                         image_embeddings.dtype,
                         batch_size,
                         num_videos_per_prompt,
-                        do_classifier_free_guidance,
                     )
                     added_time_ids = added_time_ids.to(device)
 
@@ -802,67 +758,55 @@ def main(
                     # pixel_values
                     latents = tensor_to_vae_latent(pixel_values, vae)
                     bsz = latents.shape[0]
-                    # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
-                    # timesteps = timesteps.long()
-                    scheduler.set_timesteps(num_inference_steps, device=device)
-                    random_integer = random.randint(0, num_inference_steps)
-                    timesteps = scheduler.timesteps
-                    timesteps = timesteps[random_integer]
+                    timesteps = torch.randint(0, scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
 
-                    # Prepare guidance scale
-                    guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)
-                    guidance_scale = guidance_scale.to(device, latents.dtype)
-                    guidance_scale = guidance_scale.repeat(batch_size * num_videos_per_prompt, 1)
-                    guidance_scale = _append_dims(guidance_scale, latents.ndim)
+                    # scheduler.set_timesteps(num_inference_steps, device=device)
+                    # random_integer = random.randint(0, num_inference_steps)
+                    # timesteps = scheduler.timesteps
+                    # timesteps = timesteps[random_integer]
 
                     # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                    latent_model_input = scheduler.scale_model_input(latent_model_input, timesteps)
+                    # latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    # latent_model_input = scheduler.scale_model_input(latent_model_input, timesteps)               
 
+                    # We detach the encoder hidden states for the first pass (video frames > 1)
+                    # Then we make a clone of the initial state to ensure we can train it in the loop.
+                    negative_image_embeddings = torch.zeros_like(image_embeddings)
+                    # detached_encoder_state = encoder_hidden_states.clone().detach()
+                    # trainable_encoder_state = encoder_hidden_states.clone()
+
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process) #[bsz, f, c, h , w]
+                    rnd_normal = torch.randn([bsz, 1, 1, 1, 1], device=device)
+                    sigma = (rnd_normal * P_std + P_mean).exp()
+                    c_skip = 1 / (sigma**2 + 1)
+                    c_out =  -sigma / (sigma**2 + 1) ** 0.5
+                    c_in = 1 / (sigma**2 + 1) ** 0.5
+                    c_noise = sigma.log() / 4
+                    loss_weight = (sigma ** 2 + 1) / sigma ** 2
+
+                    noisy_latents = latents + torch.randn_like(latents) * sigma
+                    input_latents = c_in * noisy_latents
                     # Concatenate image_latents over channels dimention
-                    latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
-
-                    # Get the target for loss depending on the prediction type
-                    if scheduler.prediction_type == "epsilon":
-                        target = noise
-                    elif scheduler.prediction_type == "v_prediction":
-                        target = scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        raise ValueError(f"Unknown prediction type {scheduler.prediction_type}")
-                    
-                    # Get video length
-                    video_length = latents.shape[2]
+                    input_latents = torch.cat([input_latents, image_latents], dim=2)
 
                     # Here we do two passes for video and text training.
                     # If we are on the second iteration of the loop, get one frame.
                     # This allows us to train text information only on the spatial layers.
                     losses = []
-                    should_truncate_video = video_length > 1
-
-                    # We detach the encoder hidden states for the first pass (video frames > 1)
-                    # Then we make a clone of the initial state to ensure we can train it in the loop.
-                    detached_encoder_state = encoder_hidden_states.clone().detach()
-                    trainable_encoder_state = encoder_hidden_states.clone()
 
                     for i in range(2):
-
-                        should_detach = latent_model_input.shape[2] > 1 and i == 0
-
-                        if should_truncate_video and i == 1:
-                            latent_model_input = latent_model_input[:,:,1,:,:].unsqueeze(2)
-                            target = target[:,:,1,:,:].unsqueeze(2)
-                                
                         encoder_hidden_states = (
-                            detached_encoder_state if should_detach else trainable_encoder_state
+                            negative_image_embeddings if i==0 else image_embeddings
                         )
 
-                        model_pred = unet(latent_model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
+                        model_pred = unet(input_latents, c_noise.reshape([bsz]), encoder_hidden_states=encoder_hidden_states, 
+                                          added_time_ids=added_time_ids).sample
+                        predict_x0 = c_out * model_pred + c_skip * noisy_latents 
+                        # loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        loss = ((predict_x0 - latents)**2 * loss_weight).mean()
                         losses.append(loss)
-                        
-                        # This was most likely single frame training or a single image.
-                        if video_length == 1 and i == 0: break
 
                     loss = losses[0] if len(losses) == 1 else losses[0] + losses[1] 
                 
@@ -927,7 +871,6 @@ def main(
                             diffusion_scheduler = EulerDiscreteScheduler.from_config(pipeline.scheduler.config)
                             pipeline.scheduler = diffusion_scheduler
 
-                            # prompt = text_prompt if len(validation_data.prompt) <= 0 else validation_data.prompt
                             image = load_image("./datasets/02.jpeg")
 
                             curr_dataset_name = batch['dataset']

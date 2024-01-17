@@ -1,6 +1,6 @@
 # Pretrained diffusers model path.
 
-pretrained_model_path: "./stable-video-diffusion-image2video"
+pretrained_model_path: "/data/54T/wangqiang/svd/stable-video-diffusion-img2vid"
 
 # The folder where your training outputs will be placed.
 output_dir: "./output_models"
@@ -174,16 +174,17 @@ validation_steps: 100
 
 # Which modules we want to unfreeze for the UNET. Advanced usage.
 trainable_modules:
-  - "all"
+  # - "all"
   # If you want to ignore temporal attention entirely, remove "attn1-2" and replace with ".attentions"
   # This is for self attetion. Activates for spatial and temporal dimensions if n_sample_frames > 1
   #- "attn1"
   
   # This is for cross attention (image & text data). Activates for spatial and temporal dimensions if n_sample_frames > 1
-  #- "attn2"
+  - "attn2"
   
   #  Convolution networks that hold temporal information. Activates for spatial and temporal dimensions if n_sample_frames > 1
-  #- 'temp_conv'
+  # - 'temp_conv'
+  # - "motion"
 
 
 # Which modules we want to unfreeze for the Text Encoder. Advanced usage.

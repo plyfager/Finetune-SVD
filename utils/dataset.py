@@ -513,11 +513,11 @@ class VideoCSVDataset(Dataset):
     def __init__(
         self,
         tokenizer=None,
-        width: int = 256,
-        height: int = 256,
+        width: int = 512,
+        height: int = 512,
         n_sample_frames: int = 26,
         fps: int = 8,
-        csv_path: str = "./data",
+        csv_path: str = "./datasets/validation_warping.csv",
         use_bucketing: bool = False,
         **kwargs
     ):
@@ -586,15 +586,6 @@ class VideoCSVDataset(Dataset):
         video.release()
 
         return image
-    
-    def get_prompt_ids(self, prompt):
-        return self.tokenizer(
-            prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids
 
     @staticmethod
     def __getname__(): 
@@ -605,17 +596,15 @@ class VideoCSVDataset(Dataset):
 
     def __getitem__(self, index):
         
-        video_path, prompt = self.csv_data.iloc[index]
+        video_path = self.csv_data.iloc[index, 0]
         video, _ = self.process_video_wrapper(video_path)
         
         image = self.image_from_video(video_path)
-        image = image.resize((1024, 576))
+        image = image.resize((self.width, self.height))
         image = torch.tensor(np.array(image).transpose(2, 0, 1)).unsqueeze(0).float()
         image = image / 127.5 - 1.0
 
-        prompt_ids = self.get_prompt_ids(prompt)
-
-        return {"pixel_values": normalize_input(video[0]), "image": image, "prompt_ids": prompt_ids, "text_prompt": prompt, 'dataset': self.__getname__()}
+        return {"pixel_values": normalize_input(video[0]), "image": image, 'dataset': self.__getname__()}
 
 class CachedDataset(Dataset):
     def __init__(self,cache_dir: str = ''):
@@ -731,16 +720,13 @@ class VideoFolderDataset(Dataset):
 
 if __name__ == "__main__":
     train_batch_size = 1
-    tokenizer = CLIPTokenizer.from_pretrained("damo-vilab/text-to-video-ms-1.7b", subfolder="tokenizer")
 
-    dataset = VideoCSVDataset(csv_path='./validation_warping.csv',
-                              tokenizer=tokenizer)
+    dataset = VideoCSVDataset(csv_path='/data/54T/wangqiang/svd/datasets/validation_warping.csv')
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=train_batch_size,
         shuffle=False
     )
     for step, batch in enumerate(train_dataloader):
-        # print(batch['pixel_values'], batch['prompt_ids'], batch['pixel_values'], batch['text_prompt'], batch['dataset'])
-        print(batch["image"])
+        print(batch["image"].size(), batch["pixel_values"].size())
 
