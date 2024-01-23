@@ -1,7 +1,7 @@
 # Finetune-SVD
 Finetune stable video diffusion(`image-to-video` model).
 
-## SVD-MV
+## SVD-MV(Multi-View Generation)
 | Init Image        | Before Fine-tuning |After Fine-tuning |
 |---------------|-----------------------------|-----------------------------|
 | ![demo](https://github.com/wangqiang9/Finetune-SVD/blob/main/data/1.jpg)    | ![ori](https://github.com/wangqiang9/Finetune-SVD/blob/main/data/1.gif)   | ![ft](https://github.com/wangqiang9/Finetune-SVD/blob/main/data/11cdaf2939502622815a10e5a35009c9%20(1).gif)|
