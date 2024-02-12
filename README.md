@@ -1,5 +1,12 @@
-# Finetune-SVD
-Finetune stable video diffusion(`image-to-video` model).
+# SVD-Lora
+Using Lora for finetuning stable video diffusion(`image-to-video` model).
+
+## Progress
+First, I'm trying to use peft for training lora.
+
+```
+python train_lora.py
+```
 
 ## SVD-MV(Multi-View Generation)
 | Init Image        | Before Fine-tuning |After Fine-tuning |
